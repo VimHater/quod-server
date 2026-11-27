@@ -21,6 +21,7 @@ type Models struct {
 	Split     ModelSpec
 	Formalize ModelSpec
 	Back      ModelSpec // back-translation
+	Judge     ModelSpec // faithfulness check (statement vs formalization)
 	Prove     ModelSpec
 	Explain   ModelSpec
 }
@@ -32,6 +33,7 @@ func DefaultModels() Models {
 		Split:     ModelSpec{Model: ModelFlash, Effort: EffortNone, MaxTokens: 4096},
 		Formalize: ModelSpec{Model: ModelFlash, Effort: EffortHigh},
 		Back:      ModelSpec{Model: ModelFlash, Effort: EffortNone, MaxTokens: 1024},
+		Judge:     ModelSpec{Model: ModelFlash, Effort: EffortLow},
 		Prove:     ModelSpec{Model: ModelFlash, Effort: EffortHigh},
 		Explain:   ModelSpec{Model: ModelFlash, Effort: EffortNone, MaxTokens: 2048},
 	}
@@ -45,6 +47,9 @@ type Options struct {
 	Models      Models
 	LeanVersion string  // shown to the model, e.g. "Lean v4.36.0, Mathlib v4.36.0"
 	BudgetUSD   float64 // 0 = unlimited; checked before each call
+	// Imports are the Lean modules the checker has loaded, shown to the
+	// model so it only uses what is available. Empty = all of Mathlib.
+	Imports []string
 	// MaxFeedbackRounds bounds how many (proof, feedback) pairs a proof
 	// session keeps in context; older rounds are summarized away. Default 3.
 	MaxFeedbackRounds int
@@ -113,7 +118,25 @@ func (a *Agent) callTools(ctx context.Context, spec ModelSpec, asJSON bool, tool
 }
 
 func (a *Agent) system(tmpl string) Message {
-	return System(strings.ReplaceAll(tmpl, "{{LEAN_VERSION}}", a.opts.LeanVersion))
+	return System(strings.NewReplacer(
+		"{{LEAN_VERSION}}", a.opts.LeanVersion,
+		"{{IMPORTS}}", a.importsText(),
+	).Replace(tmpl))
+}
+
+// importsText lists the loaded modules for the prompts. Harness is the
+// server's own helper and of no use to the model, so it is left out.
+func (a *Agent) importsText() string {
+	var mods []string
+	for _, m := range a.opts.Imports {
+		if m != "Harness" {
+			mods = append(mods, m)
+		}
+	}
+	if len(mods) == 0 {
+		return "all of Mathlib (`import Mathlib`)"
+	}
+	return strings.Join(mods, ", ")
 }
 
 // Lemma is a previously formalized (and possibly proved) statement that
@@ -151,7 +174,7 @@ func (a *Agent) SplitStatements(ctx context.Context, input string) ([]string, er
 	var out struct {
 		Statements []string `json:"statements"`
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(resp.Content)), &out); err != nil {
+	if err := unmarshalLenient(resp.Content, &out); err != nil {
 		return nil, fmt.Errorf("llm: split: bad json %q: %w", truncate(resp.Content, 200), err)
 	}
 	var stmts []string
@@ -228,12 +251,117 @@ func (a *Agent) BackTranslate(ctx context.Context, name, signature string, lemma
 	return strings.TrimSpace(resp.Content), nil
 }
 
+// Faithfulness is the verdict of the independent formalization check.
+type Faithfulness struct {
+	Match  bool     `json:"match"`
+	Issues []string `json:"issues"`
+}
+
+// CheckFaithfulness asks a separate call whether the Lean statement (and its
+// back-translation) says exactly what the informal statement says.
+func (a *Agent) CheckFaithfulness(ctx context.Context, text, name, signature, back string, lemmas []Lemma) (*Faithfulness, error) {
+	var b strings.Builder
+	if c := renderLemmas("Earlier statements the Lean statement may refer to:", lemmas, false); c != "" {
+		b.WriteString(c + "\n")
+	}
+	fmt.Fprintf(&b, "Informal statement:\n%s\n\nLean statement:\n```lean\ntheorem %s %s\n```\n\nPlain-English reading of the Lean statement:\n%s\n",
+		text, name, signature, back)
+	resp, err := a.call(ctx, a.opts.Models.Judge, true, System(faithfulnessSystem), User(b.String()))
+	if err != nil {
+		return nil, err
+	}
+	var f Faithfulness
+	if err := unmarshalLenient(resp.Content, &f); err != nil {
+		return nil, fmt.Errorf("llm: faithfulness: bad json %q: %w", truncate(resp.Content, 200), err)
+	}
+	var issues []string
+	for _, s := range f.Issues {
+		if s = strings.TrimSpace(s); s != "" {
+			issues = append(issues, s)
+		}
+	}
+	f.Issues = issues
+	if !f.Match && len(f.Issues) == 0 {
+		f.Issues = []string{"the check reported a mismatch without details"}
+	}
+	return &f, nil
+}
+
+// unmarshalLenient decodes model-written JSON. If strict decoding fails it
+// retries after escaping stray backslashes, typically LaTeX such as \( or
+// \frac that the model forgot to double.
+func unmarshalLenient(s string, v any) error {
+	s = strings.TrimSpace(s)
+	if bs := CodeBlocks(s); len(bs) > 0 {
+		s = bs[len(bs)-1]
+	}
+	err := json.Unmarshal([]byte(s), v)
+	if err == nil {
+		return nil
+	}
+	if err2 := json.Unmarshal([]byte(fixJSONEscapes(s)), v); err2 == nil {
+		return nil
+	}
+	return err
+}
+
+// fixJSONEscapes doubles backslashes inside strings that do not start a
+// valid JSON escape. \b \f \n \r \t followed by a letter are taken as LaTeX
+// (\frac, \neq, \times) too; this is only used after strict decoding failed.
+func fixJSONEscapes(s string) string {
+	isHex := func(c byte) bool { return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F' }
+	isLetter := func(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
+	var b strings.Builder
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !inStr {
+			inStr = c == '"'
+			b.WriteByte(c)
+			continue
+		}
+		if c == '"' {
+			inStr = false
+			b.WriteByte(c)
+			continue
+		}
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		next := byte(0)
+		if i+1 < len(s) {
+			next = s[i+1]
+		}
+		valid := false
+		switch next {
+		case '"', '\\', '/':
+			valid = true
+		case 'u':
+			valid = i+5 < len(s) && isHex(s[i+2]) && isHex(s[i+3]) && isHex(s[i+4]) && isHex(s[i+5])
+		case 'b', 'f', 'n', 'r', 't':
+			valid = !(i+2 < len(s) && isLetter(s[i+2]))
+		}
+		if valid {
+			b.WriteByte(c)
+			b.WriteByte(next)
+			i++
+		} else {
+			b.WriteString(`\\`)
+		}
+	}
+	return b.String()
+}
+
 // ProveInput describes the theorem to prove.
 type ProveInput struct {
 	Name      string
 	Signature string
 	Text      string  // natural-language statement (helps the model)
 	Context   []Lemma // only Proved ones are offered for use
+	// Extra is shown verbatim before the theorem (e.g. the outline a step
+	// belongs to, or what the direct attempts tried).
+	Extra string
 }
 
 // ProofSession is a multi-turn conversation: propose a proof, receive
@@ -242,11 +370,13 @@ type ProveInput struct {
 type ProofSession struct {
 	a                *Agent
 	spec             ModelSpec
+	system           string // prompt template: proveSystem or outlineSystem
 	intro            Message
 	rounds           []round // completed (proof, feedback) pairs
 	pending          string  // last proposed reply awaiting feedback
 	pendingReasoning string  // its reasoning (sent back when tools are used)
 	dropped          int     // rounds summarized away
+	restart          string  // after Restart: what was tried, sent instead of the old rounds
 }
 
 type round struct{ reply, reasoning, feedback string }
@@ -266,8 +396,29 @@ func (a *Agent) NewProofSessionWith(in ProveInput, spec ModelSpec) *ProofSession
 	if in.Text != "" {
 		fmt.Fprintf(&b, "Informal statement: %s\n\n", oneLine(in.Text))
 	}
+	if in.Extra != "" {
+		b.WriteString(strings.TrimSpace(in.Extra) + "\n\n")
+	}
 	fmt.Fprintf(&b, "Prove:\n```lean\ntheorem %s %s := by\n  ...\n```\nReply with the tactic script only.", in.Name, in.Signature)
-	return &ProofSession{a: a, spec: spec, intro: User(b.String())}
+	return &ProofSession{a: a, spec: spec, system: proveSystem, intro: User(b.String())}
+}
+
+// NewPlanSession starts a conversation that asks for a proof outline (see
+// outlineSystem): have-steps proved by sorry, then a proof from them. It
+// takes feedback like a proof session and uses the prover model.
+func (a *Agent) NewPlanSession(in ProveInput) *ProofSession {
+	var b strings.Builder
+	if c := renderLemmas("Previously proved theorems you may use:", in.Context, true); c != "" {
+		b.WriteString(c + "\n")
+	}
+	if in.Text != "" {
+		fmt.Fprintf(&b, "Informal statement: %s\n\n", oneLine(in.Text))
+	}
+	if in.Extra != "" {
+		b.WriteString(strings.TrimSpace(in.Extra) + "\n\n")
+	}
+	fmt.Fprintf(&b, "Write a proof outline for:\n```lean\ntheorem %s %s := by\n  ...\n```\nReply with the outline in one lean code block.", in.Name, in.Signature)
+	return &ProofSession{a: a, spec: a.opts.Models.Prove, system: outlineSystem, intro: User(b.String())}
 }
 
 // Next asks for a proof (the first one, or a fix after Feedback).
@@ -277,7 +428,7 @@ func (s *ProofSession) Next(ctx context.Context) (body string, resp *Response, e
 
 // NextProgress is Next with streaming progress reports (see Request.OnProgress).
 func (s *ProofSession) NextProgress(ctx context.Context, onProgress func(Progress)) (body string, resp *Response, err error) {
-	msgs := s.history(proveSystem, false)
+	msgs := s.history(s.system, false)
 	resp, err = s.a.callProgress(ctx, s.spec, false, onProgress, msgs...)
 	if err != nil {
 		return "", resp, err
@@ -293,6 +444,9 @@ func (s *ProofSession) NextProgress(ctx context.Context, onProgress func(Progres
 // withReasoning keeps each round's reasoning (required with tools).
 func (s *ProofSession) history(system string, withReasoning bool) []Message {
 	msgs := []Message{s.a.system(system), s.intro}
+	if s.restart != "" {
+		msgs = append(msgs, Assistant("(earlier attempts omitted)"), User(s.restart))
+	}
 	if s.dropped > 0 {
 		msgs = append(msgs, Assistant("(earlier attempts omitted)"),
 			User(fmt.Sprintf("%d earlier attempt(s) failed and are omitted. Continue.", s.dropped)))
@@ -366,13 +520,24 @@ func (s *ProofSession) Feedback(feedback string) {
 	if s.pending == "" {
 		return
 	}
-	s.rounds = append(s.rounds, round{reply: s.pending, reasoning: s.pendingReasoning, feedback: feedback +
-		"\n\nFix the proof. Reply with the complete corrected tactic script in one lean code block."})
+	fix := "\n\nFix the proof. Reply with the complete corrected tactic script in one lean code block."
+	if s.system == outlineSystem {
+		fix = "\n\nRevise the outline. Reply with the complete outline in one lean code block."
+	}
+	s.rounds = append(s.rounds, round{reply: s.pending, reasoning: s.pendingReasoning, feedback: feedback + fix})
 	s.pending, s.pendingReasoning = "", ""
 	if over := len(s.rounds) - s.a.opts.MaxFeedbackRounds; over > 0 {
 		s.rounds = s.rounds[over:]
 		s.dropped += over
 	}
+}
+
+// Restart drops the conversation so far (the model keeps repeating a failing
+// approach and its own earlier attempts anchor it) and continues from the
+// intro plus summary, which should say what was tried and what to do now.
+func (s *ProofSession) Restart(summary string) {
+	s.restart = summary
+	s.rounds, s.pending, s.pendingReasoning, s.dropped = nil, "", "", 0
 }
 
 // Rounds is the number of failed attempts recorded so far.

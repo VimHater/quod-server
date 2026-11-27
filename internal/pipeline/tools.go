@@ -49,9 +49,11 @@ type leanTools struct {
 	stmt   lean.Statement
 	base   *lean.Snapshot
 	failed *failedSet
-	rec    func(body string, o *lean.Outcome, leanTime time.Duration, repeated string) // records a check_proof
-	calls  int
-	win    *lean.Outcome
+	// rec records a check_proof: Lean's outcome (nil for a repeat) and
+	// the feedback the model got.
+	rec   func(body string, o *lean.Outcome, leanTime time.Duration, repeated, feedback string)
+	calls int
+	win   *lean.Outcome
 }
 
 func (t *leanTools) Tools() []llm.Tool { return toolSpecs }
@@ -105,7 +107,7 @@ func (t *leanTools) Run(ctx context.Context, call llm.ToolCall) (string, bool) {
 func (t *leanTools) checkProof(ctx context.Context, body string) (string, bool) {
 	norm := lean.NormalizeBody(body)
 	if fb, seen := t.failed.get(norm); seen {
-		t.rec(body, nil, 0, fb)
+		t.rec(body, nil, 0, fb, "")
 		return "This exact proof already failed with:\n" + fb, false
 	}
 	t0 := time.Now()
@@ -113,12 +115,13 @@ func (t *leanTools) checkProof(ctx context.Context, body string) (string, bool) 
 	if err != nil {
 		return "error: Lean check failed to run: " + err.Error(), false
 	}
-	t.rec(body, o, time.Since(t0), "")
+	leanTime := time.Since(t0)
 	if o.Verdict.Verified {
+		t.rec(body, o, leanTime, "", "")
 		t.win = o
 		return "Verified.", true
 	}
-	fb := lean.RenderFeedback(o, t.j.p.opts.Feedback)
+	fb := t.j.feedback(ctx, o)
 	if o.Result != nil && len(o.Result.Sorries) > 0 {
 		var b strings.Builder
 		b.WriteString("\n\nOpen goals at your sorry placeholders:")
@@ -127,6 +130,7 @@ func (t *leanTools) checkProof(ctx context.Context, body string) (string, bool) 
 		}
 		fb += b.String()
 	}
+	t.rec(body, o, leanTime, "", fb)
 	t.failed.add(norm, fb)
 	return fb, false
 }

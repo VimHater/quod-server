@@ -186,17 +186,35 @@ func NewClient(apiKey string) *Client {
 	}
 }
 
-// NewClientFromEnv reads DEEPSEEK_API_KEY (and optional DEEPSEEK_BASE_URL).
+// NewClientFromEnv reads LLM_API_KEY / LLM_BASE_URL, falling back to
+// DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL. Any OpenAI-compatible endpoint
+// works (e.g. a local 9router at http://localhost:20128/v1).
 func NewClientFromEnv() (*Client, error) {
-	key := strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY"))
+	key := strings.TrimSpace(firstEnv("LLM_API_KEY", "DEEPSEEK_API_KEY"))
 	if key == "" {
-		return nil, errors.New("DEEPSEEK_API_KEY is not set")
+		return nil, errors.New("LLM_API_KEY (or DEEPSEEK_API_KEY) is not set")
 	}
 	c := NewClient(key)
-	if u := os.Getenv("DEEPSEEK_BASE_URL"); u != "" {
+	if u := strings.TrimSpace(firstEnv("LLM_BASE_URL", "DEEPSEEK_BASE_URL")); u != "" {
 		c.BaseURL = strings.TrimRight(u, "/")
 	}
 	return c, nil
+}
+
+func firstEnv(names ...string) string {
+	for _, n := range names {
+		if v := os.Getenv(n); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// usesMaxTokens reports whether model takes the legacy max_tokens field.
+// OpenAI reasoning models (gpt-5, o-series) reject it and require
+// max_completion_tokens instead.
+func usesMaxTokens(model string) bool {
+	return strings.HasPrefix(strings.ToLower(model), "deepseek")
 }
 
 type wireRequest struct {
@@ -205,6 +223,7 @@ type wireRequest struct {
 	Tools           []Tool          `json:"tools,omitempty"`
 	ReasoningEffort Effort          `json:"reasoning_effort,omitempty"`
 	MaxTokens       int             `json:"max_tokens,omitempty"`
+	MaxCompletion   int             `json:"max_completion_tokens,omitempty"`
 	ResponseFormat  *responseFormat `json:"response_format,omitempty"`
 	Temperature     *float64        `json:"temperature,omitempty"`
 	Stream          bool            `json:"stream"`
@@ -241,9 +260,13 @@ func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 		Model:           req.Model,
 		Messages:        req.Messages,
 		ReasoningEffort: req.Effort,
-		MaxTokens:       req.MaxTokens,
 		Temperature:     req.Temperature,
 		Tools:           req.Tools,
+	}
+	if usesMaxTokens(req.Model) {
+		wr.MaxTokens = req.MaxTokens
+	} else {
+		wr.MaxCompletion = req.MaxTokens
 	}
 	if req.JSON {
 		wr.ResponseFormat = &responseFormat{Type: "json_object"}

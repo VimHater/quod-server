@@ -1,0 +1,8 @@
+# Harder bench problems for `prove -bench bench/hard.txt`.
+# Each line: expected answer (true = provable, false = the statement is false) | category | statement
+
+true  | inequality | For all positive reals a, b, c: a/(b+c) + b/(c+a) + c/(a+b) >= 3/2.
+true  | sum        | For every natural number n, the sum of k^3 for k from 1 to n equals (n(n+1)/2)^2.
+true  | number     | There are no integers x and y such that x^2 - 3y^2 = 2.
+true  | geometry   | In a triangle ABC in the Euclidean plane, if the angle BAC is a right angle (pi/2), then BC^2 = AB^2 + AC^2.
+false | number     | For every natural number n, n^2 + n + 41 is prime.

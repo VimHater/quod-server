@@ -136,3 +136,45 @@ func TestBudget(t *testing.T) {
 		t.Errorf("spent %g in %d calls", usd, calls)
 	}
 }
+
+func TestUnmarshalLenient(t *testing.T) {
+	var out struct {
+		Statements []string `json:"statements"`
+	}
+	// The split reply that failed in practice: LaTeX with single backslashes.
+	in := `{"statements":["For all positive real numbers \(a\) and \(b\), \(\frac{a}{b}+\frac{b}{a}\ge 2\)."]}`
+	if err := unmarshalLenient(in, &out); err != nil {
+		t.Fatal(err)
+	}
+	want := `For all positive real numbers \(a\) and \(b\), \(\frac{a}{b}+\frac{b}{a}\ge 2\).`
+	if len(out.Statements) != 1 || out.Statements[0] != want {
+		t.Errorf("got %q, want %q", out.Statements, want)
+	}
+	// Valid JSON keeps its escapes (\n stays a newline) and code fences are stripped.
+	var v struct{ A string }
+	fenced := "```json\n" + `{"A": "x\ny \u00e9"}` + "\n```"
+	if err := unmarshalLenient(fenced, &v); err != nil || v.A != "x\ny \u00e9" {
+		t.Errorf("valid json: %q, %v", v.A, err)
+	}
+}
+
+func TestClaimsFalse(t *testing.T) {
+	for reply, want := range map[string]bool{
+		"FALSE":                               true,
+		"FALSE\ncounterexample: n = 1":        true,
+		"FALSE. Take x = 1/2.":                true,
+		"FALSE: n = 1 fails":                  true,
+		"FALSE — x = 1/2":                     true,
+		"**FALSE**\nx = 1/2":                  true,
+		"```lean\nFALSE\n```":                 true,
+		"-- note\nFALSE":                      true,
+		"FALSEHOOD":                           false,
+		"exact absurd h FALSE_lemma":          false,
+		"nlinarith [sq_nonneg (x - 1)]":       false,
+		"by_contra h\n-- the claim is FALSE?": false,
+	} {
+		if got := ClaimsFalse(ExtractProofBody(reply)); got != want {
+			t.Errorf("ClaimsFalse(%q) = %v, want %v", reply, got, want)
+		}
+	}
+}

@@ -1,0 +1,7 @@
+# Exp/log inequalities that need no extra Lean imports (Real.exp and
+# Real.log come with Mathlib.Analysis.SpecialFunctions.Pow.Real).
+# Each line: expected answer (true = provable, false = the statement is false) | category | statement
+
+true | exp | For all real x, e^x >= 1 + x.
+true | log | For all real x > 0, ln x <= x - 1.
+true | log | For all real x > 0, x - x^2/2 <= ln(1 + x).

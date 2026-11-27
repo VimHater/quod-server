@@ -1,0 +1,8 @@
+# Olympiad-level bench problems for `prove -bench bench/olympiad.txt`.
+# Each line: expected answer (true = provable, false = the statement is false) | category | statement
+
+true  | number     | For every natural number n, the fraction (21n+4)/(14n+3) is irreducible.
+true  | inequality | For all nonnegative reals a, b, c: a(a-b)(a-c) + b(b-a)(b-c) + c(c-a)(c-b) >= 0.
+true  | number     | For every integer n, n^5 - n is divisible by 30.
+true  | geometry   | In a triangle ABC in the Euclidean plane, if AB = BC = CA then each of the angles ABC, BCA and CAB equals pi/3.
+false | number     | For every natural number n, 2^(2^n) + 1 is prime.

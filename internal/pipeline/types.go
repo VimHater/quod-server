@@ -24,6 +24,7 @@ const (
 	StatusUnformal    Status = "formalization_failed" // no Lean statement accepted
 	StatusUnverified  Status = "unverified"           // proof found, but independent verification could not run
 	StatusCanceled    Status = "canceled"
+	StatusDisproved   Status = "disproved" // the Lean statement is false (counterexample or proof of ¬)
 )
 
 // StatementResult is everything known about one statement.
@@ -34,14 +35,23 @@ type StatementResult struct {
 	Signature          string `json:"signature,omitempty"`
 	FormalizationNotes string `json:"formalization_notes,omitempty"`
 	BackTranslation    string `json:"back_translation,omitempty"`
-	Status             Status `json:"status"`
-	Proof              string `json:"proof,omitempty"`     // verified tactic script
-	LeanCode           string `json:"lean_code,omitempty"` // verified theorem + axiom check
-	Axioms             string `json:"axioms,omitempty"`
-	Explanation        string `json:"explanation,omitempty"`
+	// FaithfulnessIssues are the differences an independent check found
+	// between Text and the Lean statement (empty = none found).
+	FaithfulnessIssues  []string `json:"faithfulness_issues,omitempty"`
+	FaithfulnessChecked bool     `json:"faithfulness_checked,omitempty"`
+	Status              Status   `json:"status"`
+	// Proof and LeanCode are the verified proof; for a disproved statement
+	// they prove its negation (theorem <name>_false), unless Counterexample
+	// is set (found by testing, no proof).
+	Proof          string `json:"proof,omitempty"`
+	LeanCode       string `json:"lean_code,omitempty"`
+	Counterexample string `json:"counterexample,omitempty"`
+	Axioms         string `json:"axioms,omitempty"`
+	Explanation    string `json:"explanation,omitempty"`
 	// Verification is the independent re-check verdict (see lean.Verifier).
 	Verification *lean.VerifiedItem `json:"verification,omitempty"`
 	Attempts     []AttemptRecord    `json:"attempts,omitempty"`
+	Restarts     int                `json:"restarts,omitempty"` // proof conversations restarted because stuck
 	Error        string             `json:"error,omitempty"`
 }
 
@@ -52,6 +62,10 @@ type AttemptRecord struct {
 	N          int           `json:"n"`       // attempt number within session (automation: tactic index)
 	Model      string        `json:"model,omitempty"`
 	Effort     string        `json:"effort,omitempty"`
+	Disproof   bool          `json:"disproof,omitempty"` // an attempt to prove the negation
+	Free       bool          `json:"free,omitempty"`     // an exact repeat, not charged as an attempt
+	Plan       bool          `json:"plan,omitempty"`     // a proof outline (A3), Body is the outline
+	Step       string        `json:"step,omitempty"`     // proving this step of an outline
 	Body       string        `json:"body"`
 	Verified   bool          `json:"verified"`
 	ErrorKinds []string      `json:"error_kinds,omitempty"`
@@ -92,11 +106,20 @@ const (
 	EvProved         EventType = "proved"
 	EvFailed         EventType = "failed"
 	EvExplained      EventType = "explained"
-	EvAutomation     EventType = "automation" // automation tactics tried (Message: outcome)
-	EvStage          EventType = "stage"      // proof search moved to a ladder stage
-	EvThinking       EventType = "thinking"   // LLM still generating (throttled progress)
-	EvVerifying      EventType = "verifying"  // independent re-check started
-	EvVerified       EventType = "verified"   // independent re-check finished (Message: summary)
+	EvAutomation     EventType = "automation"   // automation tactics tried (Message: outcome)
+	EvStage          EventType = "stage"        // proof search moved to a ladder stage
+	EvThinking       EventType = "thinking"     // LLM still generating (throttled progress)
+	EvVerifying      EventType = "verifying"    // independent re-check started
+	EvVerified       EventType = "verified"     // independent re-check finished (Message: summary)
+	EvSimplified     EventType = "simplified"   // search tactics in a verified proof resolved
+	EvFaithfulness   EventType = "faithfulness" // result of the independent formalization check
+	EvDisproving     EventType = "disproving"   // no proof found (or model says FALSE); trying to prove the negation
+	EvResuming       EventType = "resuming"     // the model's FALSE claim was not confirmed; proving again
+	EvRestarted      EventType = "restarted"    // the model was stuck on one approach; conversation restarted
+	EvDisproved      EventType = "disproved"    // Statement set; counterexample or proof of ¬
+	EvPlanning       EventType = "planning"     // direct proofs failed; asking for a proof outline
+	EvPlanned        EventType = "planned"      // Lean accepted an outline; proving its steps
+	EvStepDone       EventType = "step"         // one outline step proved or given up
 	EvDone           EventType = "done"
 	EvError          EventType = "error"
 )
@@ -113,12 +136,13 @@ type Event struct {
 
 // Proposal is a formalization offered to the user for confirmation.
 type Proposal struct {
-	Index           int    `json:"index"`
-	Text            string `json:"text"`
-	Name            string `json:"name"`
-	Signature       string `json:"signature"`
-	Notes           string `json:"notes"`
-	BackTranslation string `json:"back_translation"`
+	Index           int      `json:"index"`
+	Text            string   `json:"text"`
+	Name            string   `json:"name"`
+	Signature       string   `json:"signature"`
+	Notes           string   `json:"notes"`
+	BackTranslation string   `json:"back_translation"`
+	Issues          []string `json:"issues,omitempty"` // from the faithfulness check
 }
 
 // Decision is the user's answer to a Proposal. Reject with Correction to
@@ -151,6 +175,21 @@ type Checker interface {
 // CheckerSource hands out a Checker for one job; release ends it.
 type CheckerSource interface {
 	JobChecker(ctx context.Context) (c Checker, release func(), err error)
+}
+
+// CounterexampleFinder is optionally implemented by a Checker: it tests a
+// statement for a counterexample (e.g. with Lean's `plausible`) and returns
+// "" when it finds none.
+type CounterexampleFinder interface {
+	FindCounterexample(ctx context.Context, base *lean.Snapshot, s lean.Statement) (string, error)
+}
+
+// Suggester proposes existing declarations for identifiers Lean did not
+// know; the text is appended to the feedback the model gets. It returns ""
+// when it has nothing useful (or is not ready yet). Lookups (e.g. #check)
+// go through the job's own Checker, never a separate worker.
+type Suggester interface {
+	Suggest(ctx context.Context, c Checker, unknown []string) string
 }
 
 // PoolSource gives every job its own lease on fresh pool workers, which
@@ -188,6 +227,12 @@ func (c LeaseChecker) CheckProof(ctx context.Context, base *lean.Snapshot, s lea
 func (c LeaseChecker) ExploreProof(ctx context.Context, base *lean.Snapshot, s lean.Statement, body string) (*lean.Outcome, error) {
 	return withRetry(ctx, c.Lease, func(r *lean.REPL) (*lean.Outcome, error) {
 		return lean.ExploreProof(ctx, r, base, s, body)
+	})
+}
+
+func (c LeaseChecker) FindCounterexample(ctx context.Context, base *lean.Snapshot, s lean.Statement) (string, error) {
+	return withRetry(ctx, c.Lease, func(r *lean.REPL) (string, error) {
+		return lean.FindCounterexample(ctx, r, base, s)
 	})
 }
 

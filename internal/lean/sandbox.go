@@ -55,9 +55,12 @@ func (s Sandbox) Check() error {
 	if s.Kind != SandboxBwrap {
 		return fmt.Errorf("lean: unknown sandbox %q", s.Kind)
 	}
-	if out, err := exec.Command("bwrap", "--unshare-all", "--ro-bind", "/usr", "/usr",
-		"--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64",
-		"--", "true").CombinedOutput(); err != nil {
+	// Same root layout as the real sandbox: hard-coding Arch's symlinks
+	// (/lib64 -> usr/lib) breaks Debian/Ubuntu, whose loader is only under
+	// /usr/lib64, and every exec then fails with ENOENT.
+	args := append([]string{"--unshare-all", "--ro-bind", "/usr", "/usr"}, rootDirArgs()...)
+	args = append(args, "--", "/usr/bin/true")
+	if out, err := exec.Command("bwrap", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("lean: bubblewrap unusable (install bubblewrap; unprivileged user namespaces must be enabled): %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	if s.usesSystemd() {
@@ -135,21 +138,7 @@ func (s Sandbox) wrap(cfg Config, innerEnv []string, cwd string, mounts []mount,
 			argv = append(argv, "--setenv", k, v)
 		}
 	}
-	// Recreate merged-/usr symlinks (Arch, Fedora, ...) or bind real dirs.
-	for _, d := range []string{"/bin", "/sbin", "/lib", "/lib64"} {
-		fi, err := os.Lstat(d)
-		switch {
-		case err != nil:
-			continue
-		case fi.Mode()&os.ModeSymlink != 0:
-			target, err := os.Readlink(d)
-			if err == nil {
-				argv = append(argv, "--symlink", target, d)
-			}
-		default:
-			argv = append(argv, "--ro-bind", d, d)
-		}
-	}
+	argv = append(argv, rootDirArgs()...)
 	for _, f := range []string{"/etc/ld.so.cache", "/etc/localtime"} {
 		argv = append(argv, "--ro-bind-try", f, f)
 	}
@@ -168,6 +157,27 @@ func (s Sandbox) wrap(cfg Config, innerEnv []string, cwd string, mounts []mount,
 	argv = append(argv, "--chdir", cwd, "--")
 	argv = append(argv, inner...)
 	return argv, env, nil
+}
+
+// rootDirArgs recreates the host's merged-/usr symlinks (/bin, /lib64, ...
+// pointing into /usr, whatever the distribution's layout) or binds the real
+// directories read-only.
+func rootDirArgs() []string {
+	var args []string
+	for _, d := range []string{"/bin", "/sbin", "/lib", "/lib64"} {
+		fi, err := os.Lstat(d)
+		switch {
+		case err != nil:
+			continue
+		case fi.Mode()&os.ModeSymlink != 0:
+			if target, err := os.Readlink(d); err == nil {
+				args = append(args, "--symlink", target, d)
+			}
+		default:
+			args = append(args, "--ro-bind", d, d)
+		}
+	}
+	return args
 }
 
 // ScrubEnv keeps only what the REPL needs, so secrets in the server's

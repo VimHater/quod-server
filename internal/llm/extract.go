@@ -3,6 +3,7 @@ package llm
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 var (
@@ -73,6 +74,24 @@ func ExtractSignature(reply string) (sig string, ok bool) {
 	code = reTheoremHdr.ReplaceAllString(code, "")
 	code = reSorryTail.ReplaceAllString(code, "")
 	return strings.TrimSpace(code), true
+}
+
+// ClaimsFalse reports whether a prover reply (or the body extracted from it)
+// says the theorem is false instead of proving it: a first line FALSE,
+// optionally followed by punctuation and a reason.
+func ClaimsFalse(reply string) bool {
+	first := strings.TrimSpace(firstCodeLine(reply))
+	first = strings.Trim(first, "*`_ ")
+	rest, ok := strings.CutPrefix(first, "FALSE")
+	if !ok {
+		return false
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	return strings.ContainsRune(".:-—–(,", r)
 }
 
 // Notes returns the reply text outside code blocks.

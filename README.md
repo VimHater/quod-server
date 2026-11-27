@@ -43,19 +43,48 @@ and `lean_env/lean-toolchain`. Keep them in sync.
 echo "..." | ./bin/prove -json    # machine-readable result
 ```
 
+### Background prover
+
+Importing Mathlib takes minutes. Keep it loaded in a background prover and
+every later `prove` call starts proving at once:
+
+```sh
+nohup ./bin/prove -serve > ~/.quod/serve.log 2>&1 &   # once per session
+./bin/prove "..."                 # sent to the background prover automatically
+./bin/prove -status               # uptime, imports, endpoint, jobs done
+./bin/prove -stop                 # stop it (frees the Lean worker's RAM)
+./bin/prove -local "..."          # ignore it and start Lean in this process
+```
+
+It listens on a Unix socket (`~/.quod/prove.sock`, mode 0600; `-socket` or
+`PROVE_SOCKET` to change), never on the network. Lean settings (`-lean-dir`,
+`-imports`, `-workers`) and the LLM endpoint/key are the server's; models,
+efforts, attempts and the other job flags come from each `prove` call.
+Ctrl-C in the client cancels its job on the server. `-confirm` always runs
+locally, since it asks on the terminal.
+
 | Flag | Default | |
 |---|---|---|
 | `-i` | off | prompt repeatedly (`\` continues a line, `:q` quits, Ctrl-C cancels a job) |
 | `-v` | off | show Lean feedback for failed attempts |
 | `-model` | `deepseek-flash` | prover model (`deepseek-v4-pro` for harder problems) |
 | `-effort` | (ladder) | run a single stage at this effort (`none`, `low`, `high`, `max`) instead of the ladder |
+| `-stages` | `fast,tools,deep-tools` | the proof-search ladder (see How it works) |
 | `-attempts`, `-parallel` | (per stage) | if set, override attempts per session and sessions in every stage |
 | `-no-auto` | off | skip the automation tactics tried before the LLM |
-| `-budget` | 0.50 | USD cap for the run/session |
-| `-workers` | 1 | warm Lean workers (each job gets a fresh one; use 2 with `-i`) |
+| `-budget` | 0.50 | USD cap per job |
+| `-workers` | 1 | warm Lean workers (each job gets a fresh one; use 2 with `-i` or `-serve`) |
 | `-sandbox` | `bwrap` | Lean isolation: `bwrap` or `none` (trusted input only) |
 | `-sandbox-mem`, `-sandbox-tasks` | `10G`, 256 | per-worker memory and process/thread limits |
-| `-confirm`, `-no-split`, `-no-explain`, `-json`, `-timeout`, `-lean-dir`, `-env` | | see `-h` |
+| `-verify` | on | independent kernel re-check and axiom audit of every proof (and proof of a negation) at the end |
+| `-serve`, `-status`, `-stop`, `-local`, `-socket` | | background prover, see above |
+| `-no-faith-check` | off | skip the independent statement-vs-formalization check |
+| `-no-disprove` | off | skip counterexample search and proving the negation |
+| `-no-plan` | off | skip the proof-outline stage after the ladder fails |
+| `-plan-attempts`, `-step-attempts` | 4, 4 | outlines to try; proof attempts per outline step |
+| `-plan-after` | 3 | direct attempts per session in each stage before the outline stage (caps `-attempts` unless `-no-plan`; `0` = outline right away) |
+| `-imports` | `Mathlib` | Lean modules to load (`LEAN_IMPORTS`); fewer = faster start, less RAM |
+| `-confirm`, `-no-split`, `-no-explain`, `-json`, `-timeout`, `-start-timeout`, `-cmd-timeout`, `-lean-dir`, `-env` | | see `-h` |
 
 ## HTTP server
 
@@ -207,7 +236,7 @@ DEEPSEEK_LIVE=1 go test -v -run TestLive ./internal/llm/        # real API (< $0
 ## Project structure
 
 ```
-cmd/prove/            CLI driver for the pipeline
+cmd/prove/            CLI driver for the pipeline (local, client and -serve modes)
 cmd/server/           HTTP API server
 cmd/quod-admin/       access key management
 internal/
@@ -226,12 +255,18 @@ internal/
     tasks.go            split, formalize, back-translate, prove sessions, explain
     extract.go          code/signature extraction from replies
   pipeline/           orchestration: statement chaining, repair loop, events, confirm hook
+    plan.go             proof outlines: have-steps proved separately, then assembled
+    tools.go            Lean tools for tool stages (search_lemmas, check_proof, ...)
   jobs/               job manager: queue, limits, budgets, event log, confirm hand-off
   server/             HTTP handlers, SSE, auth middleware
   auth/               principals, access key store (SQLite)
+  daemon/             background prover: Unix-socket job protocol, server and client
   dotenv/             .env loader
 lean_env/             Lake project: Mathlib + REPL + Harness
   Harness/AxiomCheck.lean   #harness_axioms command
+  Harness/Search.lean       #harness_search (search_lemmas tool)
+  Harness/Names.lean        #harness_dump_names (name hints)
+  HarnessVerify.lean        harness_verify, the trusted final checker
 scripts/bootstrap.sh  environment setup
 scripts/client.sh     example API client (shell)
 web/                  example API client (browser, GitHub Pages)
@@ -288,9 +323,44 @@ web/                  example API client (browser, GitHub Pages)
 - **Faithfulness.** The Lean statement is back-translated to English by a
   call that never sees the original text. With `-confirm` you check the two
   match before any proving happens.
+- **Faithfulness check.** A separate call compares the original text, the
+  Lean statement and its back-translation and lists differences in meaning
+  (missing hypothesis, wrong number system, ℕ subtraction, ...). A mismatch
+  sends the statement back to be re-formalized once; if it persists the
+  result carries a ⚠ warning (and `-confirm` shows it).
+- **Disproving.** Before proving, Mathlib's `plausible` tests the statement
+  for a counterexample (Lean only, ≤45 s; works for ℕ/ℤ/finite types, not
+  ℝ). If the proof attempts fail, or the model answers `FALSE` (with a
+  counterexample) instead of a proof, it gets 3 attempts at
+  `theorem <name>_false : ¬ (∀ <binders>, <prop>)`, on the last (most
+  capable) stage of the ladder. If that fails after a `FALSE` answer, the
+  ladder resumes at the stage where the claim was made. Either way the
+  statement is reported as `disproved`, with the counterexample or the
+  Lean-checked proof of the negation (also written to the Lean file). With
+  `-verify`, a proof of the negation goes through the same independent
+  re-check as a proof.
+- **Proof outlines.** If the whole ladder fails, the model writes an
+  outline: `have stepK : P := by sorry` lines, then a proof of the theorem
+  from them. Lean checks that proof at once, with the steps as hypotheses.
+  Each step is then proved as its own theorem (the original hypotheses and
+  the earlier steps assumed), all steps in parallel. Steps that fail go back
+  to the outline conversation with their errors, so it can split or replace
+  them, and steps that were already proved are reused unchanged. When every
+  step is proved, the pieces are put together into one proof with no
+  `sorry`, and Lean checks it against the original statement. Steps are
+  proved on the last stage of the ladder. The negation is tried only after
+  this stage.
 - **Feedback.** Lean errors are classified (unknown identifier, unsolved
   goals, tactic failure, ...) and rendered under the offending proof line,
-  with the goal state before the failing tactic.
+  with the goal state before the failing tactic. For an unknown identifier
+  the feedback also lists similar existing declarations with their
+  signatures (`#harness_dump_names` builds the index once per set of
+  imports, in a one-shot sandboxed Lean process that may write only its own
+  temporary directory; cached in `~/.quod/names/`).
+- **Search tactics.** If a verified proof still contains `exact?`,
+  `apply?`, `simp?`, ... the tactic Lean found ("Try this: ...") is
+  substituted and the proof re-checked, so the saved proof names the lemmas
+  it uses.
 
 ## Security
 
